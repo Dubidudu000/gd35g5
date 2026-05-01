@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>花朵与动物</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/addons/p5.sound.min.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #e6e6fa;
+    }
+  </style>
+</head>
+<body>
+  <script>
+let mic, fft;
+let images = [];
+let animals = [];
+let bgPhoto;
+let flowers = [];
+let audioStarted = false;
+let remoteLoadDone = false;
+let remoteLoadError = "";
+let albumImageCount = 0;
+let childFailedCount = 0;
+let animalFailedCount = 0;
+
+// --- 1. 配置区 ---
+let numImages = 50;
+let numAnimals = 26;
+let flowerCooldown = 800;
+let lastFlowerTime = 0;
+let s = 1;
+let animalStayMin = 500; // 动物图片最短停留时长（毫秒）
+let animalStayMax = 1200; // 动物图片最长停留时长（毫秒）
+let statusPanelDuration = 10000; // 左上角提示框显示时长（毫秒）
+let albumApiUrl = "https://imgur.com/ajaxalbums/getimages/aSILk0D/hit.json?all=true";
+// -----------------
+
+function preload() {
+  bgPhoto = null;
+}
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  s = height / 1080;
+
+  colorMode(HSB, 360, 255, 255, 255);
+  mic = new p5.AudioIn();
+  mic.start();
+  fft = new p5.FFT();
+  fft.setInput(mic);
+  loadAlbumImages();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  s = height / 1080;
+}
+
+function draw() {
+  if (bgPhoto) drawBackgroundCover(bgPhoto);
+  else background(230, 230, 250);
+
+  let vol = mic.getLevel();
+  fft.analyze();
+  let spectralCentroid = fft.getCentroid();
+
+  if (millis() < statusPanelDuration) {
+    push();
+    fill(0, 150); noStroke();
+    rect(20 * s, 20 * s, 420 * s, 100 * s, 12 * s);
+    fill(255); textSize(16 * s); textAlign(LEFT, TOP);
+    text("✅ 成功加载小孩图: " + images.length + " 张（失败 " + childFailedCount + "）", 40 * s, 40 * s);
+    text("🐾 成功加载动物图: " + animals.length + " 张（失败 " + animalFailedCount + "）", 40 * s, 60 * s);
+    if (!remoteLoadDone && !remoteLoadError) text("⏳ 正在从 Imgur 读取图片...", 40 * s, 85 * s);
+    else if (remoteLoadError) text("⚠️ 读取失败：" + remoteLoadError, 40 * s, 85 * s);
+    else text("📦 相册条目: " + albumImageCount + "（ID: aSILk0D）", 40 * s, 85 * s);
+    pop();
+  }
+
+  let currentTime = millis();
+  if (audioStarted && vol > 0.02 && (currentTime - lastFlowerTime > flowerCooldown)) {
+    flowers.push(new Flower(random(width), random(height * 0.3, height * 0.8), spectralCentroid));
+    lastFlowerTime = currentTime;
+  }
+
+  for (let i = flowers.length - 1; i >= 0; i--) {
+    flowers[i].grow();
+    if (flowers[i].shouldRemove) {
+      flowers.splice(i, 1);
+      continue;
+    }
+    flowers[i].display();
+  }
+
+  if (!audioStarted) drawOverlay();
+}
+
+function loadAlbumImages() {
+  const requestUrl = albumApiUrl + "&_ts=" + Date.now();
+  loadJSON(
+    requestUrl,
+    (payload) => {
+      const albumImages = payload && payload.data && Array.isArray(payload.data.images) ? payload.data.images : [];
+      albumImageCount = albumImages.length;
+      const imageExts = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+      const allUrls = albumImages
+        .filter((item) => item && item.hash && item.ext && imageExts.has(String(item.ext).toLowerCase()))
+        .map((item) => {
+          const ext = String(item.ext).toLowerCase();
+          const originUrl = "https://i.imgur.com/" + item.hash + ext;
+          // 大图优先改用 Imgur 缩略图，降低失败率与内存占用
+          const useThumb = Number(item.size || 0) > 1200000 || Number(item.width || 0) > 2200 || Number(item.height || 0) > 2200;
+          const thumbUrl = "https://i.imgur.com/" + item.hash + "l" + ext;
+          return useThumb ? thumbUrl : originUrl;
+        });
+
+      if (allUrls.length === 0) {
+        remoteLoadError = "相册没有可用图片";
+        return;
+      }
+
+      // 不做循环补齐：有多少图就用多少图，避免重复
+      const childUrls = allUrls.slice(0, numImages);
+      const animalUrls = allUrls.slice(numImages, numImages + numAnimals);
+
+      if (childUrls.length + animalUrls.length === 0) {
+        remoteLoadError = "可用图片数量为 0";
+        return;
+      }
+      const markGroupDone = (() => {
+        let groupDone = 0;
+        return () => {
+          groupDone += 1;
+          if (groupDone >= 2) {
+            remoteLoadDone = true;
+            if (!bgPhoto && images.length > 0) bgPhoto = images[0];
+          }
+        };
+      })();
+
+      loadUrlsSequentiallyWithRetry(childUrls, images, "child", markGroupDone);
+      loadUrlsSequentiallyWithRetry(animalUrls, animals, "animal", markGroupDone);
+    },
+    () => {
+      remoteLoadError = "无法访问 Imgur 相册";
+    }
+  );
+}
+
+function loadUrlsSequentiallyWithRetry(urls, targetArray, groupType, onGroupDone) {
+  let index = 0;
+  const loadNext = () => {
+    if (index >= urls.length) {
+      onGroupDone();
+      return;
+    }
+
+    const url = urls[index];
+    index += 1;
+
+    const tryLoad = (attempt) => {
+      loadImage(
+        url,
+        (img) => {
+          targetArray.push(img);
+          loadNext();
+        },
+        () => {
+          if (attempt < 2) {
+            tryLoad(attempt + 1);
+          } else {
+            console.warn("加载失败(" + groupType + "): " + url);
+            if (groupType === "child") childFailedCount += 1;
+            else animalFailedCount += 1;
+            loadNext();
+          }
+        }
+      );
+    };
+
+    tryLoad(1);
+  };
+
+  loadNext();
+}
+
+function drawBackgroundCover(img) {
+  let imgRatio = img.width / img.height;
+  let canvasRatio = width / height;
+  let renderW, renderH, offsetX, offsetY;
+  if (imgRatio > canvasRatio) {
+    renderH = height; renderW = img.width * (height / img.height);
+    offsetX = (width - renderW) / 2; offsetY = 0;
+  } else {
+    renderW = width; renderH = img.height * (width / img.width);
+    offsetX = 0; offsetY = (height - renderH) / 2;
+  }
+  image(img, offsetX, offsetY, renderW, renderH);
+}
+
+function mousePressed() {
+  if (!audioStarted) { userStartAudio(); audioStarted = true; return; }
+  let hit = false;
+  for (let f of flowers) if (f.checkClick(mouseX, mouseY)) hit = true;
+  if (!hit) {
+    flowers.push(new Flower(mouseX, mouseY, 1500));
+    lastFlowerTime = millis();
+  }
+}
+
+function drawOverlay() {
+  fill(0, 200); rect(0, 0, width, height);
+  fill(255); textAlign(CENTER, CENTER); textSize(42 * s);
+  text("【延时交互版】\n动物图片会自动变回花朵\n点击屏幕开始", width/2, height/2);
+}
+
+class Flower {
+  constructor(x, y, freq) {
+    this.x = x; this.targetY = y;
+    this.stemH = 0; this.maxH = height - y;
+    this.bloomed = false; this.isAnimal = false;
+    this.petalSize = 0;
+    this.maxPetalSize = random(100, 140) * s;
+    this.wobbleOffset = random(1000);
+    this.appearanceScale = 1;
+    this.smokeAlpha = 0;
+    this.animalStartTime = 0;
+    this.currentAnimalStay = animalStayMin;
+    this.shouldRemove = false;
+
+    let hueValue = map(freq, 800, 4500, 240, 0, true);
+    this.c = color(hueValue, 180, 255, 180);
+
+    // 延迟取图：避免对象创建时图片还未加载完成导致一直为 null
+    this.myImg = null;
+    this.myAnimalImg = null;
+  }
+
+  checkClick(mx, my) {
+    if (!this.bloomed) return false;
+    let wobble = sin(frameCount * 0.03 + this.wobbleOffset) * (20 * s);
+    if (abs(mx - (this.x + wobble)) < 80 * s && abs(my - (height - this.stemH)) < 80 * s) {
+      // 点击后固定切换到动物态，避免再次点击把花茎/花瓣切回来
+      this.isAnimal = true;
+      this.animalStartTime = millis();
+      this.currentAnimalStay = random(animalStayMin, animalStayMax);
+      this.appearanceScale = 0; 
+      this.smokeAlpha = 255;
+      return true;
+    }
+    return false;
+  }
+
+  grow() {
+    if (!this.bloomed) {
+      this.stemH += (18 * s);
+      if (this.stemH >= this.maxH) this.bloomed = true;
+    } else if (this.petalSize < this.maxPetalSize) {
+      this.petalSize += (6 * s);
+    }
+
+    if (this.isAnimal && millis() - this.animalStartTime > this.currentAnimalStay) {
+      // 动物态结束后整朵直接消失（不恢复花茎和花瓣）
+      this.shouldRemove = true;
+      return;
+    }
+
+    if (this.appearanceScale < 1.0) this.appearanceScale = lerp(this.appearanceScale, 1.2, 0.2);
+    else this.appearanceScale = lerp(this.appearanceScale, 1.0, 0.15);
+    if (this.smokeAlpha > 0) this.smokeAlpha -= 15;
+  }
+
+  display() {
+    push();
+    let wobble = sin(frameCount * 0.03 + this.wobbleOffset) * (20 * s);
+    translate(this.x + wobble, height);
+
+    if (!this.isAnimal) {
+      stroke(120, 80, 100, 150);
+      strokeWeight(8 * s);
+      line(0, 0, 0, -this.stemH);
+    }
+
+    if (this.bloomed) {
+      translate(0, -this.stemH);
+      if (this.smokeAlpha > 0) {
+        noStroke(); fill(255, this.smokeAlpha);
+        ellipse(0, 0, (255 - this.smokeAlpha) * 1.5 * s);
+      }
+      scale(this.appearanceScale);
+
+      if (!this.isAnimal) {
+        fill(this.c); noStroke();
+        for (let i = 0; i < 8; i++) {
+          rotate(PI/4);
+          ellipse(0, this.petalSize * 0.8, this.petalSize * 0.6, this.petalSize);
+        }
+      }
+      this.drawCore();
+    }
+    pop();
+  }
+
+  drawCore() {
+    let r = this.isAnimal ? (280 * s) : (this.petalSize * 1.1);
+    if (!this.myImg && images.length > 0) {
+      let validImages = images.filter((item) => item && item.width > 0);
+      if (validImages.length > 0) this.myImg = random(validImages);
+    }
+    if (!this.myAnimalImg && animals.length > 0) {
+      let validAnimals = animals.filter((item) => item && item.width > 0);
+      if (validAnimals.length > 0) this.myAnimalImg = random(validAnimals);
+    }
+
+    let img = this.isAnimal ? this.myAnimalImg : this.myImg;
+    if (img && img.width > 0) {
+      push();
+      let scaleFactor = Math.max(r / img.width, r / img.height);
+      imageMode(CENTER);
+      if (!this.isAnimal) {
+        stroke(255); strokeWeight(6 * s); fill(255); ellipse(0, 0, r + 10 * s, r + 10 * s);
+        drawingContext.save();
+        drawingContext.beginPath();
+        drawingContext.arc(0, 0, r / 2, 0, TWO_PI);
+        drawingContext.closePath();
+        drawingContext.clip();
+        image(img, 0, 0, img.width * scaleFactor, img.height * scaleFactor);
+        drawingContext.restore();
+      } else {
+        image(img, 0, 0, img.width * scaleFactor, img.height * scaleFactor);
+      }
+      pop();
+    }
+  }
+}
+  </script>
+</body>
+</html>
